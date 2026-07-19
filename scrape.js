@@ -39,6 +39,8 @@ const MIN_DISCOUNT_PERCENT = 10; // strictly greater than this survives the filt
 const VEGAN_KEYWORDS = ['vegan', 'vegano', 'vegana', 'plant-based', 'plant based'];
 const OUTPUT_FILE = path.join(__dirname, 'deals.md');
 const PER_RESTAURANT_DELAY_MS = 1500; // be gentle — this loops over multiple pages per run
+const DEBUG_DIR = path.join(__dirname, 'debug');
+const DEBUG = process.env.DEBUG_SNAPSHOTS !== '0'; // on by default; set DEBUG_SNAPSHOTS=0 to disable
 
 // Verified 2026-07-19 by manually inspecting the live site. Still not
 // stable long-term — Uber Eats' markup changes without notice — but these
@@ -92,8 +94,29 @@ async function waitForFirstVisible(page, selectors, timeout) {
   return null;
 }
 
+/**
+ * Saves a screenshot + full HTML + basic page info for a given point in the
+ * run, so a failure can be diagnosed from the Actions artifact instead of
+ * guessed at. Never throws — a debug-capture failure shouldn't fail the run.
+ */
+async function captureDebug(page, label) {
+  if (!DEBUG) return;
+  try {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true });
+    const base = path.join(DEBUG_DIR, label);
+    await page.screenshot({ path: `${base}.png`, fullPage: true });
+    const html = await page.content();
+    fs.writeFileSync(`${base}.html`, html, 'utf8');
+    fs.writeFileSync(`${base}.info.txt`, `url: ${page.url()}\ntitle: ${await page.title()}\ncapturedAt: ${new Date().toISOString()}\n`, 'utf8');
+    log(`  (debug snapshot saved: debug/${label}.png / .html)`);
+  } catch (err) {
+    log(`  WARNING: failed to capture debug snapshot "${label}": ${err.message}`);
+  }
+}
+
 async function setDeliveryAddress(page) {
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+  await captureDebug(page, '01-landing');
 
   if (isBotChallengePage(page)) {
     throw new Error(`Uber Eats served a bot-check page instead of the landing page (redirected to ${page.url()}).`);
@@ -104,6 +127,7 @@ async function setDeliveryAddress(page) {
     log('WARNING: could not find an address input after waiting 15s. ' +
       'Skipping address step — if the session already has a saved address this may be fine, ' +
       'otherwise inspect the page and update SELECTORS.addressInputCandidates.');
+    await captureDebug(page, '02-address-input-not-found');
     return;
   }
 
@@ -113,6 +137,7 @@ async function setDeliveryAddress(page) {
   const suggestion = await waitForFirstVisible(page, SELECTORS.addressSuggestionCandidates, 8000);
   if (!suggestion) {
     log('WARNING: no address suggestion dropdown appeared within 8s. Pressing Enter as a fallback.');
+    await captureDebug(page, '02-address-suggestion-not-found');
     await addressInput.press('Enter');
   } else {
     await suggestion.click();
@@ -122,6 +147,7 @@ async function setDeliveryAddress(page) {
   // no separate confirm step to click.
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1500);
+  await captureDebug(page, '03-after-address');
 }
 
 /**
@@ -138,10 +164,12 @@ async function openVeganCategory(page) {
   } catch {
     log('WARNING: could not find a "Vegan" category link on the feed page within 10s. ' +
       'Continuing with whatever is on the current page.');
+    await captureDebug(page, '04-vegan-category-link-not-found');
     return;
   }
   await veganLink.click();
   await page.waitForTimeout(2500); // let the results page hydrate
+  await captureDebug(page, '05-after-vegan-category');
 }
 
 async function collectRestaurantLinks(page, max) {

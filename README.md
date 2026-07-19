@@ -15,6 +15,16 @@ restaurant results, and writes any vegan item discounted more than 10% to
 - **Output**: each run overwrites `deals.md` and, if it changed, the
   workflow commits and pushes it back to the repo using the built-in
   `GITHUB_TOKEN` (job has `permissions: contents: write` for this).
+- **Debug snapshots**: every run also saves a screenshot + full HTML +
+  URL/title of the page at four points (landing page, right after setting
+  the address, and right after opening the Vegan category — with an extra
+  snapshot if a step didn't find what it expected). These are uploaded as a
+  workflow artifact named `debug-snapshots-<run number>`, downloadable from
+  the run's page in the **Actions** tab (bottom of the page, under
+  "Artifacts") — not committed to the repo, and auto-deleted after 14 days.
+  This is how to see what Uber Eats is actually serving the runner, e.g. to
+  tell a locale/geo-IP issue apart from a genuine selector break. Set the
+  `DEBUG_SNAPSHOTS=0` env var to turn this off.
 
 No repository secrets are required — address-setting and menu browsing are
 both public, unauthenticated actions, and the commit-back uses the token
