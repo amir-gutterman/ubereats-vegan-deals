@@ -8,19 +8,24 @@
  * OUTPUT_FILE (deals.md). Intended to run unattended on a schedule (see
  * .github/workflows/scraper.yml).
  *
- * Two things worth knowing before treating an empty run as a selector bug:
+ * KNOWN, ACCEPTED LIMITATION: GitHub-hosted runners get served Uber Eats'
+ * Cloudflare bot-check ("Performing security verification") on a real
+ * fraction of runs — confirmed directly via debug snapshots, not
+ * speculation. This is Cloudflare doing its job against automated
+ * datacenter traffic; no stealth/fingerprint-spoofing/proxy-rotation is
+ * implemented or planned to get around it, by design. Instead:
+ *   - isBotChallengePage() detects both known forms (redirect to
+ *     def.uber.com, and the same-origin "Just a moment..." Cloudflare page)
+ *     and reports it plainly.
+ *   - buildMarkdown() writes a clearly-labeled "blocked" message into
+ *     deals.md when this happens, so a blocked run is never confused with
+ *     "checked and found nothing."
+ * A run that gets blocked is expected behavior, not something to debug.
  *
- * 1. Uber Eats' "Vegan" search/category link does not actually filter to
- *    vegan restaurants — it re-ranks the full local result set, so
- *    collectRestaurantLinks() filters candidates by whether "vegan" appears
- *    in the result card's own text before taking the top MAX_RESTAURANTS.
- * 2. Uber Eats runs its own bot/fraud challenge (redirects to
- *    def.uber.com/en/challenge) and it can trigger on direct, automated
- *    navigation to a page. This script detects that redirect and reports it
- *    plainly (see isBotChallengePage) rather than treating it as "0 items
- *    found." No attempt is made to solve or route around that challenge —
- *    if it's showing up often, that's Uber Eats blocking this automation,
- *    which is a stop sign, not a bug to fix.
+ * Separately: Uber Eats' "Vegan" search/category link does not actually
+ * filter to vegan restaurants — it re-ranks the full local result set, so
+ * collectRestaurantLinks() filters candidates by whether "vegan" appears in
+ * the result card's own text before taking the top MAX_RESTAURANTS.
  *
  * Beyond that, Uber Eats' DOM uses hashed/obfuscated CSS class names that
  * change without notice, so selectors can still drift over time even though
@@ -67,18 +72,28 @@ function log(...args) {
 }
 
 /**
- * Uber Eats redirects to its own bot/fraud challenge page (def.uber.com)
- * when it decides a session looks automated. Detecting this explicitly lets
- * the rest of the script report "we got blocked" instead of misreporting it
- * as "the selectors found nothing."
+ * Uber Eats blocks automated traffic two different ways, confirmed by
+ * inspecting actual debug snapshots from live runs:
+ *   1. Redirects to its own bot/fraud challenge (def.uber.com).
+ *   2. Serves Cloudflare's "Performing security verification" challenge
+ *      directly on www.ubereats.com — same hostname, so it doesn't show up
+ *      as a redirect, only as a distinctive page title ("Just a moment...").
+ * Detecting both explicitly lets the rest of the script report "we got
+ * blocked" instead of misreporting it as "the selectors found nothing."
  */
-function isBotChallengePage(page) {
+async function isBotChallengePage(page) {
   try {
     const host = new URL(page.url()).hostname;
-    return host !== 'www.ubereats.com' && host !== 'ubereats.com';
+    if (host !== 'www.ubereats.com' && host !== 'ubereats.com') return true;
   } catch {
-    return false;
+    // fall through to the title check
   }
+  try {
+    if (/just a moment/i.test(await page.title())) return true;
+  } catch {
+    // ignore
+  }
+  return false;
 }
 
 async function waitForFirstVisible(page, selectors, timeout) {
@@ -118,8 +133,8 @@ async function setDeliveryAddress(page) {
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
   await captureDebug(page, '01-landing');
 
-  if (isBotChallengePage(page)) {
-    throw new Error(`Uber Eats served a bot-check page instead of the landing page (redirected to ${page.url()}).`);
+  if (await isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of the landing page (title: "${await page.title()}", url: ${page.url()}).`);
   }
 
   const addressInput = await waitForFirstVisible(page, SELECTORS.addressInputCandidates, 15000);
@@ -173,8 +188,8 @@ async function openVeganCategory(page) {
 }
 
 async function collectRestaurantLinks(page, max) {
-  if (isBotChallengePage(page)) {
-    throw new Error(`Uber Eats served a bot-check page instead of results (redirected to ${page.url()}).`);
+  if (await isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of results (title: "${await page.title()}", url: ${page.url()}).`);
   }
 
   const candidates = await page.evaluate((sel) => {
@@ -347,8 +362,8 @@ function itemName(item) {
 async function scanRestaurant(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-  if (isBotChallengePage(page)) {
-    throw new Error(`Uber Eats served a bot-check page instead of the menu (redirected to ${page.url()}).`);
+  if (await isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of the menu (title: "${await page.title()}", url: ${page.url()}).`);
   }
 
   await waitForMenuHydration(page);
@@ -367,6 +382,10 @@ async function scanRestaurant(page, url) {
   return { candidateCount: rawItems.length, veganCount: veganItems.length, deals };
 }
 
+function isBlockError(err) {
+  return /bot-check page/.test(err.message);
+}
+
 function buildMarkdown(allDeals, meta) {
   const lines = [];
   lines.push('# Vegan Uber Eats deals');
@@ -374,12 +393,31 @@ function buildMarkdown(allDeals, meta) {
   lines.push(`Last updated: ${meta.timestamp}`);
   lines.push('');
   lines.push(`Delivery address: ${DELIVERY_ADDRESS} (delivery fee assumed €0 — Uber One)`);
+
+  if (meta.blockedBeforeDiscovery) {
+    lines.push('');
+    lines.push('## This run was blocked by Uber Eats');
+    lines.push('');
+    lines.push('Uber Eats served its bot-check page before any restaurant could be scanned. ' +
+      'This means **the run could not check for deals at all** — it is not the same as ' +
+      '"checked and found nothing." No scraping happened this run.');
+    lines.push('');
+    lines.push(`Detail: ${meta.blockReason}`);
+    return lines.join('\n') + '\n';
+  }
+
   lines.push(`Restaurants scanned: ${meta.restaurantsScanned} · Threshold: > ${MIN_DISCOUNT_PERCENT}% off`);
+  if (meta.restaurantsBlocked > 0) {
+    lines.push('');
+    lines.push(`⚠️ ${meta.restaurantsBlocked} restaurant page(s) were blocked by Uber Eats' bot-check ` +
+      'and could not be scanned this run — the results below are from the ones that got through.');
+  }
   lines.push('');
 
   if (!allDeals.length) {
-    lines.push('No qualifying deals found this run. If this looks wrong, the DOM selectors ' +
-      'likely need adjusting — see README.md for how to inspect and update them.');
+    lines.push('No qualifying deals found this run among the restaurants that were reachable. ' +
+      'If this looks wrong and no blocks were reported above, the DOM selectors likely need ' +
+      'adjusting — see README.md for how to inspect and update them.');
     return lines.join('\n') + '\n';
   }
 
@@ -398,16 +436,28 @@ async function main() {
   const page = await browser.newPage();
   const allDeals = [];
   let restaurantsScanned = 0;
+  let restaurantsBlocked = 0;
 
   try {
-    log('Setting delivery address...');
-    await setDeliveryAddress(page);
+    let blockedBeforeDiscovery = false;
+    let blockReason = null;
+    let restaurantUrls = [];
 
-    log('Opening the Vegan category...');
-    await openVeganCategory(page);
+    try {
+      log('Setting delivery address...');
+      await setDeliveryAddress(page);
 
-    const restaurantUrls = await collectRestaurantLinks(page, MAX_RESTAURANTS);
-    log(`Found ${restaurantUrls.length} restaurant(s) to scan.`);
+      log('Opening the Vegan category...');
+      await openVeganCategory(page);
+
+      restaurantUrls = await collectRestaurantLinks(page, MAX_RESTAURANTS);
+      log(`Found ${restaurantUrls.length} restaurant(s) to scan.`);
+    } catch (err) {
+      if (!isBlockError(err)) throw err;
+      blockedBeforeDiscovery = true;
+      blockReason = err.message;
+      log(`BLOCKED: ${err.message}`);
+    }
 
     for (const url of restaurantUrls) {
       log(`Scanning: ${url}`);
@@ -417,7 +467,12 @@ async function main() {
         log(`  ${result.candidateCount} candidate items, ${result.veganCount} vegan-tagged, ${result.deals.length} deal(s) > ${MIN_DISCOUNT_PERCENT}%.`);
         allDeals.push(...result.deals);
       } catch (err) {
-        log(`  WARNING: failed to scan ${url}: ${err.message}`);
+        if (isBlockError(err)) {
+          restaurantsBlocked += 1;
+          log(`  BLOCKED: ${err.message}`);
+        } else {
+          log(`  WARNING: failed to scan ${url}: ${err.message}`);
+        }
       }
       await page.waitForTimeout(PER_RESTAURANT_DELAY_MS);
     }
@@ -427,6 +482,9 @@ async function main() {
     const markdown = buildMarkdown(allDeals, {
       timestamp: new Date().toISOString(),
       restaurantsScanned,
+      restaurantsBlocked,
+      blockedBeforeDiscovery,
+      blockReason,
     });
 
     fs.writeFileSync(OUTPUT_FILE, markdown, 'utf8');
