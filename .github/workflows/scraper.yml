@@ -1,0 +1,33 @@
+name: Uber Eats Vegan Deal Finder
+
+on:
+  workflow_dispatch:
+    inputs:
+      UBER_EATS_URL:
+        description: 'Uber Eats menu URL to scan'
+        required: true
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          UBER_EATS_URL: ${{ inputs.UBER_EATS_URL }}
+        run: node scrape.js
