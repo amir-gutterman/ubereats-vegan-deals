@@ -3,16 +3,29 @@
 /**
  * Fully autonomous Uber Eats vegan-discount finder.
  *
- * No inputs at runtime: sets a fixed delivery address, searches "Vegan",
- * scans the top N restaurant results, and writes the results to OUTPUT_FILE
- * (deals.md). Intended to run unattended on a schedule (see
+ * No inputs at runtime: sets a fixed delivery address, opens the "Vegan"
+ * category, scans the top N restaurant results, and writes the results to
+ * OUTPUT_FILE (deals.md). Intended to run unattended on a schedule (see
  * .github/workflows/scraper.yml).
  *
- * Uber Eats' DOM uses hashed/obfuscated CSS class names that change without
- * notice, so every selector below is a best-effort starting point, not a
- * verified-stable hook. If a run produces "No qualifying deals found" but
- * you know deals exist, inspect the live site and update SELECTORS — see
- * README.md for a walkthrough.
+ * Two things worth knowing before treating an empty run as a selector bug:
+ *
+ * 1. Uber Eats' "Vegan" search/category link does not actually filter to
+ *    vegan restaurants — it re-ranks the full local result set, so
+ *    collectRestaurantLinks() filters candidates by whether "vegan" appears
+ *    in the result card's own text before taking the top MAX_RESTAURANTS.
+ * 2. Uber Eats runs its own bot/fraud challenge (redirects to
+ *    def.uber.com/en/challenge) and it can trigger on direct, automated
+ *    navigation to a page. This script detects that redirect and reports it
+ *    plainly (see isBotChallengePage) rather than treating it as "0 items
+ *    found." No attempt is made to solve or route around that challenge —
+ *    if it's showing up often, that's Uber Eats blocking this automation,
+ *    which is a stop sign, not a bug to fix.
+ *
+ * Beyond that, Uber Eats' DOM uses hashed/obfuscated CSS class names that
+ * change without notice, so selectors can still drift over time even though
+ * they were verified against the live site as of 2026-07-19. See README.md
+ * for how to re-verify and update them.
  */
 
 const fs = require('fs');
@@ -21,33 +34,25 @@ const { chromium } = require('playwright');
 
 const BASE_URL = 'https://www.ubereats.com/es-en';
 const DELIVERY_ADDRESS = 'Calle del Molino de Viento 18, Madrid';
-const SEARCH_KEYWORD = 'Vegan';
 const MAX_RESTAURANTS = 12;
 const MIN_DISCOUNT_PERCENT = 10; // strictly greater than this survives the filter
-const VEGAN_KEYWORDS = ['vegan', 'plant-based', 'plant based'];
+const VEGAN_KEYWORDS = ['vegan', 'vegano', 'vegana', 'plant-based', 'plant based'];
 const OUTPUT_FILE = path.join(__dirname, 'deals.md');
 const PER_RESTAURANT_DELAY_MS = 1500; // be gentle — this loops over multiple pages per run
 
+// Verified 2026-07-19 by manually inspecting the live site. Still not
+// stable long-term — Uber Eats' markup changes without notice — but these
+// reflect what's actually there today, not guesses.
 const SELECTORS = {
   addressInputCandidates: [
     'input[aria-label*="delivery address" i]',
     'input[placeholder*="delivery address" i]',
-    'input[aria-label*="address" i]',
   ],
   addressSuggestionCandidates: [
     '[role="listbox"] [role="option"]',
-    'li[role="option"]',
-    'ul li button',
   ],
-  addressConfirmButtonCandidates: [
-    'button:has-text("Done")',
-    'button:has-text("Confirm")',
-    'button:has-text("Continue")',
-  ],
-  searchInputCandidates: [
-    'input[aria-label*="search" i]',
-    'input[placeholder*="search" i]',
-  ],
+  // There's no separate "confirm" step: clicking a suggestion navigates
+  // straight to the results feed.
   restaurantLinkSelector: 'a[href*="/store/"]',
   // A heading we can wait on to know a store page has hydrated.
   storeHeaderCandidates: [
@@ -59,20 +64,44 @@ function log(...args) {
   console.error('[scrape]', ...args);
 }
 
+/**
+ * Uber Eats redirects to its own bot/fraud challenge page (def.uber.com)
+ * when it decides a session looks automated. Detecting this explicitly lets
+ * the rest of the script report "we got blocked" instead of misreporting it
+ * as "the selectors found nothing."
+ */
+function isBotChallengePage(page) {
+  try {
+    const host = new URL(page.url()).hostname;
+    return host !== 'www.ubereats.com' && host !== 'ubereats.com';
+  } catch {
+    return false;
+  }
+}
+
+async function waitForFirstVisible(page, selectors, timeout) {
+  for (const selector of selectors) {
+    try {
+      const locator = page.locator(selector).first();
+      await locator.waitFor({ state: 'visible', timeout });
+      return locator;
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
 async function setDeliveryAddress(page) {
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 
-  let addressInput = null;
-  for (const selector of SELECTORS.addressInputCandidates) {
-    const locator = page.locator(selector).first();
-    if (await locator.count()) {
-      addressInput = locator;
-      break;
-    }
+  if (isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of the landing page (redirected to ${page.url()}).`);
   }
 
+  const addressInput = await waitForFirstVisible(page, SELECTORS.addressInputCandidates, 15000);
   if (!addressInput) {
-    log('WARNING: could not find an address input on the landing page. ' +
+    log('WARNING: could not find an address input after waiting 15s. ' +
       'Skipping address step — if the session already has a saved address this may be fine, ' +
       'otherwise inspect the page and update SELECTORS.addressInputCandidates.');
     return;
@@ -80,76 +109,76 @@ async function setDeliveryAddress(page) {
 
   await addressInput.click();
   await addressInput.fill(DELIVERY_ADDRESS);
-  await page.waitForTimeout(1500); // let the autocomplete suggestions load
 
-  let suggestion = null;
-  for (const selector of SELECTORS.addressSuggestionCandidates) {
-    const locator = page.locator(selector).first();
-    if (await locator.count()) {
-      suggestion = locator;
-      break;
-    }
-  }
-
+  const suggestion = await waitForFirstVisible(page, SELECTORS.addressSuggestionCandidates, 8000);
   if (!suggestion) {
-    log('WARNING: no address suggestion dropdown found. Pressing Enter as a fallback.');
+    log('WARNING: no address suggestion dropdown appeared within 8s. Pressing Enter as a fallback.');
     await addressInput.press('Enter');
   } else {
     await suggestion.click();
   }
 
-  for (const selector of SELECTORS.addressConfirmButtonCandidates) {
-    const locator = page.locator(selector).first();
-    if (await locator.count()) {
-      await locator.click().catch(() => {});
-      break;
-    }
-  }
-
-  await page.waitForTimeout(1000);
+  // Selecting a suggestion navigates straight to the results feed — there's
+  // no separate confirm step to click.
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1500);
 }
 
-async function searchForVegan(page) {
-  let input = null;
-  for (const selector of SELECTORS.searchInputCandidates) {
-    const locator = page.locator(selector).first();
-    if (await locator.count()) {
-      input = locator;
-      break;
-    }
-  }
-
-  if (!input) {
-    log('WARNING: could not find a search input on the feed page. ' +
-      'Skipping search step — update SELECTORS.searchInputCandidates.');
+/**
+ * Uber Eats' "Vegan" category link does not filter results — it re-ranks
+ * the same full local result set, with an unrelated mix (grocery stores
+ * etc.) still at the top. This clicks it anyway (it's still the closest
+ * thing to a discovery entry point) and lets collectRestaurantLinks() do
+ * the actual vegan filtering by result-card text.
+ */
+async function openVeganCategory(page) {
+  const veganLink = page.locator('a', { hasText: /^Vegan$/ }).first();
+  try {
+    await veganLink.waitFor({ state: 'visible', timeout: 10000 });
+  } catch {
+    log('WARNING: could not find a "Vegan" category link on the feed page within 10s. ' +
+      'Continuing with whatever is on the current page.');
     return;
   }
-
-  await input.click();
-  await input.fill(SEARCH_KEYWORD);
-  await input.press('Enter');
-  await page.waitForTimeout(2500); // let the results feed hydrate
+  await veganLink.click();
+  await page.waitForTimeout(2500); // let the results page hydrate
 }
 
 async function collectRestaurantLinks(page, max) {
-  const hrefs = await page.evaluate((sel) => {
-    const seen = new Set();
-    const result = [];
-    for (const a of Array.from(document.querySelectorAll(sel))) {
-      if (a.href && !seen.has(a.href)) {
-        seen.add(a.href);
-        result.push(a.href);
-      }
-    }
-    return result;
-  }, SELECTORS.restaurantLinkSelector);
-
-  if (!hrefs.length) {
-    log('WARNING: found no restaurant links on the search results page. ' +
-      'Update SELECTORS.restaurantLinkSelector.');
+  if (isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of results (redirected to ${page.url()}).`);
   }
 
-  return hrefs.slice(0, max);
+  const candidates = await page.evaluate((sel) => {
+    const seen = new Set();
+    const out = [];
+    for (const a of Array.from(document.querySelectorAll(sel))) {
+      if (!a.href || seen.has(a.href)) continue;
+      seen.add(a.href);
+      let card = a;
+      for (let i = 0; i < 3 && card.parentElement; i++) card = card.parentElement;
+      out.push({ href: a.href, cardText: card.textContent.replace(/\s+/g, ' ').trim() });
+    }
+    return out;
+  }, SELECTORS.restaurantLinkSelector);
+
+  if (!candidates.length) {
+    log('WARNING: found no restaurant links on the results page. ' +
+      'Update SELECTORS.restaurantLinkSelector.');
+    return [];
+  }
+
+  const veganNamed = candidates.filter((c) =>
+    VEGAN_KEYWORDS.some((kw) => c.cardText.toLowerCase().includes(kw)));
+
+  if (!veganNamed.length) {
+    log(`WARNING: none of the ${candidates.length} result cards mention "vegan" by name. ` +
+      `Falling back to the first ${max} results as-is (the per-item vegan filter later still applies, ` +
+      'but most of these pages will likely yield zero vegan items).');
+    return candidates.slice(0, max).map((c) => c.href);
+  }
+
+  return veganNamed.slice(0, max).map((c) => c.href);
 }
 
 async function waitForMenuHydration(page) {
@@ -289,6 +318,11 @@ function itemName(item) {
 
 async function scanRestaurant(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+  if (isBotChallengePage(page)) {
+    throw new Error(`Uber Eats served a bot-check page instead of the menu (redirected to ${page.url()}).`);
+  }
+
   await waitForMenuHydration(page);
   await page.waitForTimeout(2000); // menu items hydrate after the header
 
@@ -312,7 +346,7 @@ function buildMarkdown(allDeals, meta) {
   lines.push(`Last updated: ${meta.timestamp}`);
   lines.push('');
   lines.push(`Delivery address: ${DELIVERY_ADDRESS} (delivery fee assumed €0 — Uber One)`);
-  lines.push(`Search keyword: "${SEARCH_KEYWORD}" · Restaurants scanned: ${meta.restaurantsScanned} · Threshold: > ${MIN_DISCOUNT_PERCENT}% off`);
+  lines.push(`Restaurants scanned: ${meta.restaurantsScanned} · Threshold: > ${MIN_DISCOUNT_PERCENT}% off`);
   lines.push('');
 
   if (!allDeals.length) {
@@ -341,8 +375,8 @@ async function main() {
     log('Setting delivery address...');
     await setDeliveryAddress(page);
 
-    log(`Searching for "${SEARCH_KEYWORD}"...`);
-    await searchForVegan(page);
+    log('Opening the Vegan category...');
+    await openVeganCategory(page);
 
     const restaurantUrls = await collectRestaurantLinks(page, MAX_RESTAURANTS);
     log(`Found ${restaurantUrls.length} restaurant(s) to scan.`);
