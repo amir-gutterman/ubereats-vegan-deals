@@ -1,17 +1,17 @@
 name: Uber Eats Vegan Deal Finder
 
 on:
-  workflow_dispatch:
-    inputs:
-      UBER_EATS_URL:
-        description: 'Uber Eats menu URL to scan'
-        required: true
-        type: string
+  schedule:
+    - cron: '0 13,20 * * *'
+  workflow_dispatch: {} # manual override for testing; no inputs needed
+
+permissions:
+  contents: write
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,6 +28,16 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run scraper
-        env:
-          UBER_EATS_URL: ${{ inputs.UBER_EATS_URL }}
         run: node scrape.js
+
+      - name: Commit and push deals.md
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deals.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update vegan deals ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi

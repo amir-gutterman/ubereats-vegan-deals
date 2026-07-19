@@ -1,7 +1,7 @@
 {
   "name": "ubereats-vegan-deals",
   "version": "1.0.0",
-  "description": "Personal browser-automation tool that scans an Uber Eats menu for vegan items on discount > 10%.",
+  "description": "Autonomous browser-automation tool that discovers vegan Uber Eats restaurants near a fixed address and reports items on discount > 10%.",
   "type": "commonjs",
   "main": "scrape.js",
   "scripts": {

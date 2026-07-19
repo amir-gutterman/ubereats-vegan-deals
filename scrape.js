@@ -1,24 +1,34 @@
 'use strict';
 
 /**
- * Personal Uber Eats vegan-discount finder.
+ * Fully autonomous Uber Eats vegan-discount finder.
+ *
+ * No inputs at runtime: sets a fixed delivery address, searches "Vegan",
+ * scans the top N restaurant results, and writes the results to OUTPUT_FILE
+ * (deals.md). Intended to run unattended on a schedule (see
+ * .github/workflows/scraper.yml).
  *
  * Uber Eats' DOM uses hashed/obfuscated CSS class names that change without
- * notice, so the selectors below are best-effort starting points, not
- * verified-stable hooks. If a run comes back empty, open the target menu in
- * a normal browser, use devtools to find the current attributes/text
- * patterns, and update SELECTORS below. See README.md for a walkthrough.
+ * notice, so every selector below is a best-effort starting point, not a
+ * verified-stable hook. If a run produces "No qualifying deals found" but
+ * you know deals exist, inspect the live site and update SELECTORS — see
+ * README.md for a walkthrough.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
-const TARGET_URL = process.env.UBER_EATS_URL;
+const BASE_URL = 'https://www.ubereats.com/es-en';
 const DELIVERY_ADDRESS = 'Calle del Molino de Viento 18, Madrid';
+const SEARCH_KEYWORD = 'Vegan';
+const MAX_RESTAURANTS = 12;
 const MIN_DISCOUNT_PERCENT = 10; // strictly greater than this survives the filter
 const VEGAN_KEYWORDS = ['vegan', 'plant-based', 'plant based'];
+const OUTPUT_FILE = path.join(__dirname, 'deals.md');
+const PER_RESTAURANT_DELAY_MS = 1500; // be gentle — this loops over multiple pages per run
 
 const SELECTORS = {
-  // Homepage address entry point. Try a few common patterns; first match wins.
   addressInputCandidates: [
     'input[aria-label*="delivery address" i]',
     'input[placeholder*="delivery address" i]',
@@ -34,7 +44,12 @@ const SELECTORS = {
     'button:has-text("Confirm")',
     'button:has-text("Continue")',
   ],
-  // A heading we can wait on to know the store page has hydrated.
+  searchInputCandidates: [
+    'input[aria-label*="search" i]',
+    'input[placeholder*="search" i]',
+  ],
+  restaurantLinkSelector: 'a[href*="/store/"]',
+  // A heading we can wait on to know a store page has hydrated.
   storeHeaderCandidates: [
     'h1',
   ],
@@ -45,7 +60,7 @@ function log(...args) {
 }
 
 async function setDeliveryAddress(page) {
-  await page.goto('https://www.ubereats.com/', { waitUntil: 'domcontentloaded' });
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 
   let addressInput = null;
   for (const selector of SELECTORS.addressInputCandidates) {
@@ -57,7 +72,7 @@ async function setDeliveryAddress(page) {
   }
 
   if (!addressInput) {
-    log('WARNING: could not find an address input on the homepage. ' +
+    log('WARNING: could not find an address input on the landing page. ' +
       'Skipping address step — if the session already has a saved address this may be fine, ' +
       'otherwise inspect the page and update SELECTORS.addressInputCandidates.');
     return;
@@ -92,6 +107,49 @@ async function setDeliveryAddress(page) {
   }
 
   await page.waitForTimeout(1000);
+}
+
+async function searchForVegan(page) {
+  let input = null;
+  for (const selector of SELECTORS.searchInputCandidates) {
+    const locator = page.locator(selector).first();
+    if (await locator.count()) {
+      input = locator;
+      break;
+    }
+  }
+
+  if (!input) {
+    log('WARNING: could not find a search input on the feed page. ' +
+      'Skipping search step — update SELECTORS.searchInputCandidates.');
+    return;
+  }
+
+  await input.click();
+  await input.fill(SEARCH_KEYWORD);
+  await input.press('Enter');
+  await page.waitForTimeout(2500); // let the results feed hydrate
+}
+
+async function collectRestaurantLinks(page, max) {
+  const hrefs = await page.evaluate((sel) => {
+    const seen = new Set();
+    const result = [];
+    for (const a of Array.from(document.querySelectorAll(sel))) {
+      if (a.href && !seen.has(a.href)) {
+        seen.add(a.href);
+        result.push(a.href);
+      }
+    }
+    return result;
+  }, SELECTORS.restaurantLinkSelector);
+
+  if (!hrefs.length) {
+    log('WARNING: found no restaurant links on the search results page. ' +
+      'Update SELECTORS.restaurantLinkSelector.');
+  }
+
+  return hrefs.slice(0, max);
 }
 
 async function waitForMenuHydration(page) {
@@ -131,11 +189,8 @@ async function extractRawItems(page) {
 
     const priceRegex = /€\s?\d+[.,]\d{2}|\d+[.,]\d{2}\s?€/g;
     const percentOffRegex = /(\d{1,3})\s?%\s*off/i;
-    const twoForOneRegex = /\b2\s*[-x]?\s*for\s*1\b|buy\s*1\s*get\s*1/i;
+    const twoForOneRegex = /\b2\s*[-x]?\s*for\s*1\b|buy\s*1\s*get\s*1|2\s*por\s*1/i;
 
-    // Candidate item containers: prefer explicit test hooks, fall back to
-    // any element whose own text (not descendants') looks like a price and
-    // whose ancestor block also contains a name-like text node.
     const candidateSelectors = [
       '[data-testid="store-item"]',
       '[data-testid*="menu-item" i]',
@@ -152,11 +207,9 @@ async function extractRawItems(page) {
     }
 
     if (!nodes.length) {
-      // Fallback heuristic: any element whose text matches a price pattern,
-      // deduplicated to the smallest common ancestor "card".
       const all = Array.from(document.querySelectorAll('body *'));
       nodes = all.filter((el) => {
-        if (el.children.length > 6) return false; // skip big containers
+        if (el.children.length > 6) return false;
         const text = el.textContent || '';
         return priceRegex.test(text) && text.length < 400;
       });
@@ -221,78 +274,102 @@ function computeDiscount(item) {
 
   if (item.twoForOne) {
     // Approximation: buying 2 and paying for 1 is a 50% discount on the pair.
-    // Flagged explicitly since it's an assumption, not a parsed number.
-    return { discountPercent: 50, originalPrice: null, salePrice: null, note: 'assumed from "2-for-1" wording' };
+    return { discountPercent: 50, originalPrice: null, salePrice: null, note: 'assumed from "2-for-1 / 2 por 1" wording' };
   }
 
   return null;
 }
 
 function itemName(item) {
-  // Best-effort: strip price substrings and known badge phrases out of the
-  // raw text to leave something name-like. Not exact — verify against
-  // console.error debug output if names look wrong.
   let name = item.rawText;
   for (const p of item.prices) name = name.replace(p, '');
   name = name.replace(/(\d{1,3})\s?%\s*off/i, '');
   return name.replace(/\s+/g, ' ').trim().slice(0, 80);
 }
 
-function toMarkdownTable(deals) {
-  const header = '| Restaurant | Item | Original Price | Sale Price | Discount |\n' +
-    '|---|---|---|---|---|';
-  const rows = deals.map((d) => {
+async function scanRestaurant(page, url) {
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await waitForMenuHydration(page);
+  await page.waitForTimeout(2000); // menu items hydrate after the header
+
+  const rawItems = await extractRawItems(page);
+  const veganItems = rawItems.filter(isVegan);
+
+  const deals = [];
+  for (const item of veganItems) {
+    const discount = computeDiscount(item);
+    if (discount && discount.discountPercent > MIN_DISCOUNT_PERCENT) {
+      deals.push({ item, discount, sourceUrl: url });
+    }
+  }
+  return { candidateCount: rawItems.length, veganCount: veganItems.length, deals };
+}
+
+function buildMarkdown(allDeals, meta) {
+  const lines = [];
+  lines.push('# Vegan Uber Eats deals');
+  lines.push('');
+  lines.push(`Last updated: ${meta.timestamp}`);
+  lines.push('');
+  lines.push(`Delivery address: ${DELIVERY_ADDRESS} (delivery fee assumed €0 — Uber One)`);
+  lines.push(`Search keyword: "${SEARCH_KEYWORD}" · Restaurants scanned: ${meta.restaurantsScanned} · Threshold: > ${MIN_DISCOUNT_PERCENT}% off`);
+  lines.push('');
+
+  if (!allDeals.length) {
+    lines.push('No qualifying deals found this run. If this looks wrong, the DOM selectors ' +
+      'likely need adjusting — see README.md for how to inspect and update them.');
+    return lines.join('\n') + '\n';
+  }
+
+  lines.push('| Restaurant | Vegan Item | Original Price | Sale Price | Discount |');
+  lines.push('|---|---|---|---|---|');
+  for (const d of allDeals) {
     const orig = d.discount.originalPrice !== null ? `€${d.discount.originalPrice.toFixed(2)}` : 'n/a';
     const sale = d.discount.salePrice !== null ? `€${d.discount.salePrice.toFixed(2)}` : 'n/a';
-    return `| ${d.item.restaurantName} | ${itemName(d.item)} | ${orig} | ${sale} | ${d.discount.discountPercent.toFixed(0)}% (${d.discount.note}) |`;
-  });
-  return [header, ...rows].join('\n');
+    lines.push(`| ${d.item.restaurantName} | ${itemName(d.item)} | ${orig} | ${sale} | ${d.discount.discountPercent.toFixed(0)}% (${d.discount.note}) |`);
+  }
+  return lines.join('\n') + '\n';
 }
 
 async function main() {
-  if (!TARGET_URL) {
-    console.error('ERROR: set UBER_EATS_URL to the menu page you want to scan.');
-    process.exitCode = 1;
-    return;
-  }
-
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  const allDeals = [];
+  let restaurantsScanned = 0;
 
   try {
+    log('Setting delivery address...');
     await setDeliveryAddress(page);
 
-    log(`Navigating to target menu: ${TARGET_URL}`);
-    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
-    await waitForMenuHydration(page);
-    // Menus are client-rendered after the header appears; give it a beat.
-    await page.waitForTimeout(2000);
+    log(`Searching for "${SEARCH_KEYWORD}"...`);
+    await searchForVegan(page);
 
-    const rawItems = await extractRawItems(page);
-    log(`Extracted ${rawItems.length} candidate item nodes.`);
+    const restaurantUrls = await collectRestaurantLinks(page, MAX_RESTAURANTS);
+    log(`Found ${restaurantUrls.length} restaurant(s) to scan.`);
 
-    const veganItems = rawItems.filter(isVegan);
-    log(`${veganItems.length} of those matched vegan/plant-based signals.`);
-
-    const deals = [];
-    for (const item of veganItems) {
-      const discount = computeDiscount(item);
-      if (discount && discount.discountPercent > MIN_DISCOUNT_PERCENT) {
-        deals.push({ item, discount });
+    for (const url of restaurantUrls) {
+      log(`Scanning: ${url}`);
+      try {
+        const result = await scanRestaurant(page, url);
+        restaurantsScanned += 1;
+        log(`  ${result.candidateCount} candidate items, ${result.veganCount} vegan-tagged, ${result.deals.length} deal(s) > ${MIN_DISCOUNT_PERCENT}%.`);
+        allDeals.push(...result.deals);
+      } catch (err) {
+        log(`  WARNING: failed to scan ${url}: ${err.message}`);
       }
+      await page.waitForTimeout(PER_RESTAURANT_DELAY_MS);
     }
 
-    deals.sort((a, b) => b.discount.discountPercent - a.discount.discountPercent);
+    allDeals.sort((a, b) => b.discount.discountPercent - a.discount.discountPercent);
 
-    console.log(`\n# Vegan deals > ${MIN_DISCOUNT_PERCENT}% off`);
-    console.log(`Delivery address: ${DELIVERY_ADDRESS} (delivery fee assumed €0 — Uber One)\n`);
+    const markdown = buildMarkdown(allDeals, {
+      timestamp: new Date().toISOString(),
+      restaurantsScanned,
+    });
 
-    if (!deals.length) {
-      console.log('No qualifying deals found. If this looks wrong, the DOM selectors likely ' +
-        'need adjusting — see README.md for how to inspect and update them.');
-    } else {
-      console.log(toMarkdownTable(deals));
-    }
+    fs.writeFileSync(OUTPUT_FILE, markdown, 'utf8');
+    log(`Wrote ${allDeals.length} deal(s) to ${OUTPUT_FILE}.`);
+    console.log(markdown);
   } finally {
     await browser.close();
   }
