@@ -5,21 +5,42 @@ delivery address, opens Uber Eats' "Vegan" category, scans up to 12
 restaurant results, and writes any vegan item discounted more than 10% to
 [`deals.md`](deals.md) in this repo — a dashboard you can check anytime.
 
-## Known limitation: Uber Eats blocks a real fraction of runs
+## Runs on a self-hosted runner (your PC), not GitHub's cloud
 
-GitHub-hosted runners get served Uber Eats' Cloudflare bot-check
-("Performing security verification... Cloudflare") on some runs — confirmed
-directly via a debug snapshot, not a guess (`debug-snapshots-3` artifact,
-2026-07-19: title `Just a moment...`, page explicitly attributed to
-Cloudflare). This is Cloudflare doing what it's designed to do against
-automated traffic from datacenter IPs running headless browsers, and that
-applies to any cloud host, not just GitHub's — a different VPS or CI
-provider wouldn't reliably fix it, only delay hitting the same wall.
+GitHub's shared cloud runners got served Uber Eats' Cloudflare bot-check
+("Performing security verification... Cloudflare") on every single run
+tried from there — confirmed directly via debug snapshot, not a guess.
+Cloudflare does this to automated traffic from datacenter IPs running
+headless browsers; that applies to any cloud host, not just GitHub's, so
+switching CI providers wouldn't have fixed it.
 
-**This script does not implement or plan to implement anything to defeat
-that check** — no stealth/fingerprint-spoofing, no proxy rotation, no
-CAPTCHA-solving. A blocked run is treated as expected, acceptable behavior:
+Since there was no always-on secondary device available, this now runs as
+a **self-hosted GitHub Actions runner installed as a Windows service on
+your own PC** (`runs-on: [self-hosted, Windows, X64]` in
+`.github/workflows/scraper.yml`). Traffic originates from your normal
+residential IP with no other change to the automation itself — still no
+stealth/fingerprint-spoofing/proxy-rotation/CAPTCHA-solving, that standing
+decision hasn't changed. This should see the Cloudflare check far less
+often, but the detection and honest-labeling described below stay in place
+as a safety net regardless, since it can still happen.
 
+**What this means practically:**
+- Your PC needs to be on and connected to the internet for a scheduled or
+  manually-triggered run to actually execute. The runner service starts
+  automatically on boot, so you don't need to log in or open anything —
+  just have the machine powered on.
+- If the PC is off when the twice-daily schedule fires, that run just sits
+  queued on GitHub's side until the runner comes back online, rather than
+  failing outright.
+- The runner service is visible in Windows Services as
+  `actions.runner.amir-gutterman-ubereats-vegan-deals.amir-pc`, and in the
+  repo's **Settings → Actions → Runners** on GitHub.
+- Because this is a public repo, the self-hosted runner only executes code
+  from triggers you control (`schedule`, `workflow_dispatch`) — there's no
+  `pull_request` trigger, which is the usual risk with public-repo
+  self-hosted runners. Worth keeping in mind before adding one.
+
+**Bot-check detection, unchanged:**
 - `isBotChallengePage()` detects both forms Uber Eats uses (redirect to
   `def.uber.com`, and the same-origin Cloudflare "Just a moment..." page)
   and reports it plainly in the logs.
@@ -27,17 +48,14 @@ CAPTCHA-solving. A blocked run is treated as expected, acceptable behavior:
   Eats"** section instead of silently showing an empty deals table — so a
   blocked run is never confused with "checked and genuinely found nothing."
 
-Practically: expect `deals.md` to sometimes say "blocked" instead of
-showing deals. That's the honest result of running this from cloud
-infrastructure, not a bug to chase.
-
 ## How it runs
 
 - **Schedule**: `.github/workflows/scraper.yml` runs it automatically twice
-  a day (`0 13,20 * * *` UTC).
+  a day (`0 13,20 * * *` UTC), on the self-hosted runner.
 - **Manual override**: the workflow also has a no-input `workflow_dispatch`
   trigger, so you can hit **Run workflow** in the Actions tab (including
-  from the GitHub mobile app) any time without waiting for the schedule.
+  from the GitHub mobile app) any time without waiting for the schedule —
+  it'll queue and run as soon as the runner picks it up.
 - **Output**: each run overwrites `deals.md` and, if it changed, the
   workflow commits and pushes it back to the repo using the built-in
   `GITHUB_TOKEN` (job has `permissions: contents: write` for this).
@@ -57,7 +75,7 @@ GitHub Actions already provides.
 
 ```
 npm install
-npx playwright install --with-deps chromium
+npx playwright install chromium
 npm run scrape
 ```
 
