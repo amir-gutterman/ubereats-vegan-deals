@@ -50,7 +50,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "No changes to commit."
           } else {
-            $timestamp = Get-Date -AsUTC -Format "yyyy-MM-dd HH:mm 'UTC'"
+            $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
             git commit -m "Update vegan deals ($timestamp)"
             git push
           }
