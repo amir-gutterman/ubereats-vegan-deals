@@ -45,12 +45,43 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deals.md
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "No changes to commit."
-          } else {
+
+          # deals.md is wholesale-regenerated each run, not incrementally
+          # edited, so "last run wins" is a safe conflict strategy. Retry
+          # with resync in case another run's push landed first (this can
+          # happen when several queued runs land close together, e.g. after
+          # the runner PC comes back online).
+          $dealsContent = Get-Content -Path "deals.md" -Raw
+          $maxAttempts = 5
+          $pushed = $false
+
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            git add deals.md
+            git diff --cached --quiet
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "No changes to commit."
+              $pushed = $true
+              break
+            }
+
             $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
             git commit -m "Update vegan deals ($timestamp)"
             git push
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Pushed successfully."
+              $pushed = $true
+              break
+            }
+
+            Write-Host "Push rejected (attempt $i of $maxAttempts) - another run updated the branch first. Syncing and retrying..."
+            git fetch origin master
+            git reset --hard origin/master
+            Set-Content -Path "deals.md" -Value $dealsContent -NoNewline
+            Start-Sleep -Seconds (Get-Random -Minimum 2 -Maximum 8)
+          }
+
+          if (-not $pushed) {
+            Write-Host "##[error]Failed to push deals.md after $maxAttempts attempts."
+            exit 1
           }
