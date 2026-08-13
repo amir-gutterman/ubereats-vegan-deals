@@ -1,6 +1,6 @@
 # Vegan Uber Eats deals
 
-Last updated: 2026-08-12T14:22:24.702Z
+Last updated: 2026-08-13T14:24:08.123Z
 
 Delivery address: Calle del Molino de Viento 18, Madrid (delivery fee assumed €0 — Uber One)
 
